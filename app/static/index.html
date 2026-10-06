@@ -88,6 +88,7 @@
           <button class="btn btn-sm tab active" data-view="endpoints">按端点</button>
           <button class="btn btn-sm tab" data-view="findings">扁平列表</button>
           <button class="btn btn-sm tab" data-view="coverage">调用覆盖</button>
+          <button class="btn btn-sm tab" data-view="release">发布放行</button>
         </div>
       </div>
 
@@ -118,6 +119,19 @@
           响应体可判定约束均通过时计入覆盖。
         </p>
         <div id="coverage-body"></div>
+      </div>
+
+      <!-- ===================== release gate view ===================== -->
+      <div id="list-release" class="release-view" hidden>
+        <p class="hint" style="margin:8px 0 14px">
+          裁决始终由服务端读取该分析的<b>完整 findings</b> 计算（与本页严重度筛选、
+          端点汇总及反例自检的「待定」状态无关）。可为破坏性 / 无法判定 finding
+          登记<b>放行理由</b>与 <b>UTC 到期时间</b>的例外；例外同时绑定
+          <b>报告版本指纹</b>——同分析 ID 重算报告后旧许可自动失效，finding 消失或
+          到期也不生效。剩余破坏性项<b>阻断</b>，否则剩余无法判定项<b>待核</b>，
+          均无则<b>可放行</b>。
+        </p>
+        <div id="release-body"></div>
       </div>
     </section>
   </main>

@@ -7,6 +7,7 @@ PostgreSQL and reports it via ``/api/health``.
 from __future__ import annotations
 
 import threading
+from datetime import timezone
 from typing import Any, Optional
 
 from .db import db
@@ -18,6 +19,8 @@ class _MemoryStore:
         self._analyses: dict[str, dict] = {}
         self._packages: dict[str, dict] = {}
         self._coverage: dict[str, dict] = {}
+        # key: (analysis_id, report_version, finding_id) -> exception dict
+        self._exceptions: dict[tuple[str, str, str], dict] = {}
 
     @property
     def available(self) -> bool:
@@ -76,7 +79,37 @@ class _MemoryStore:
             self._analyses.pop(analysis_id, None)
             self._packages.pop(analysis_id, None)
             self._coverage.pop(analysis_id, None)
+            for key in [k for k in self._exceptions if k[0] == analysis_id]:
+                self._exceptions.pop(key, None)
         return existed
+
+    # ------------------------------------------------------- release exceptions
+    def list_exceptions(self, analysis_id: str) -> list[dict]:
+        with self._lock:
+            return [dict(e) for k, e in self._exceptions.items()
+                    if k[0] == analysis_id]
+
+    def upsert_exception(self, analysis_id: str, report_version: str,
+                         finding_id: str, reason: str, expires_at: str,
+                         created_by: Optional[str], now_ts: str) -> None:
+        with self._lock:
+            key = (analysis_id, report_version, finding_id)
+            existing = self._exceptions.get(key)
+            self._exceptions[key] = {
+                "finding_id": finding_id,
+                "report_version": report_version,
+                "reason": reason,
+                "expires_at": expires_at,
+                "created_by": created_by,
+                "created_at": existing["created_at"] if existing else now_ts,
+                "updated_at": now_ts,
+            }
+
+    def delete_exception(self, analysis_id: str, report_version: str,
+                         finding_id: str) -> bool:
+        with self._lock:
+            return self._exceptions.pop(
+                (analysis_id, report_version, finding_id), None) is not None
 
 
 _memory = _MemoryStore()
@@ -167,6 +200,47 @@ class Store:
         if self.db.available:
             return self.db.delete_analysis(analysis_id)
         return _memory.delete(analysis_id)
+
+    # ------------------------------------------------------- release exceptions
+    def list_exceptions(self, analysis_id: str) -> list[dict]:
+        if self.db.available:
+            rows = self.db.list_exceptions(analysis_id)
+            if rows is not None:
+                return rows
+        return _memory.list_exceptions(analysis_id)
+
+    def upsert_exception(self, analysis_id: str, report_version: str,
+                         finding_id: str, reason: str, expires_at,
+                         created_by: Optional[str], now_ts) -> None:
+        """Persist a release exception bound to one concrete report version.
+
+        ``expires_at``/``now_ts`` are timezone-aware datetimes (Postgres path)
+        or UTC ISO strings (memory path); each backend receives the form it
+        stores. Callers in routes pass datetimes; the memory fallback converts
+        via :meth:`upsert_exception_memory`.
+        """
+        if self.db.available:
+            ok = self.db.upsert_exception(
+                analysis_id, report_version, finding_id, reason,
+                expires_at, created_by, now_ts)
+            if not ok:
+                _memory.upsert_exception(
+                    analysis_id, report_version, finding_id, reason,
+                    expires_at.astimezone(timezone.utc).isoformat(),
+                    created_by, now_ts.astimezone(timezone.utc).isoformat())
+        else:
+            _memory.upsert_exception(
+                analysis_id, report_version, finding_id, reason,
+                expires_at.astimezone(timezone.utc).isoformat(),
+                created_by, now_ts.astimezone(timezone.utc).isoformat())
+
+    def delete_exception(self, analysis_id: str, report_version: str,
+                         finding_id: str) -> bool:
+        if self.db.available:
+            return self.db.delete_exception(
+                analysis_id, report_version, finding_id)
+        return _memory.delete_exception(
+            analysis_id, report_version, finding_id)
 
 
 store = Store()

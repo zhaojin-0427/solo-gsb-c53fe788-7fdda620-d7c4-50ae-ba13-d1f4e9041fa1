@@ -6,6 +6,8 @@ from ..analysis import analyze, filter_report, from_envelope
 from ..config import settings
 from ..services.loader import PackageError
 from ..services.coverage import CoverageError, build_coverage
+from ..services.release import ExceptionValidationError, decide, \
+    parse_expires_at, report_version_of
 from ..services.replay import replay
 from ..store import store
 
@@ -183,6 +185,114 @@ def _dumps_deterministic(doc) -> str:
 def _fingerprint(payload: str) -> str:
     import hashlib
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------- 发布放行裁决
+def _load_analysis_or_404(analysis_id: str) -> dict:
+    record = store.get(analysis_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="分析不存在")
+    return record
+
+
+@router.put("/analyses/{analysis_id}/findings/{finding_id}/exception")
+async def register_exception(request: Request, analysis_id: str,
+                             finding_id: str):
+    """为指定 finding 登记一条发布例外（理由 + UTC 到期时间）。
+
+    例外绑定**当前完整报告的版本指纹**与 finding ID：同分析 ID 重算导致
+    报告变化后，旧许可因版本不匹配而不生效；finding 消失或到期同样失效。
+    未知 finding ID 一律拒绝（404）。同一 finding 重复登记为更新。
+    """
+    record = _load_analysis_or_404(analysis_id)
+    # 必须基于完整 findings 校验，不接受任何筛选后的子集
+    full_findings = record["report"]["findings"]
+    finding = next((f for f in full_findings
+                    if f["id"] == finding_id), None)
+    if not finding:
+        raise HTTPException(
+            status_code=404,
+            detail=f"finding {finding_id} 不存在于该分析的完整报告中，"
+                   "不能为未知结果登记例外")
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400,
+                            detail="请求体必须是 JSON 对象")
+    reason = body.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise HTTPException(status_code=400,
+                            detail="reason 必填：登记例外的放行理由")
+    try:
+        expires_dt = parse_expires_at(body.get("expires_at"))
+    except ExceptionValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    created_by_raw = body.get("created_by")
+    created_by = (created_by_raw.strip()
+                  if isinstance(created_by_raw, str)
+                  and created_by_raw.strip() else None)
+
+    report_version = report_version_of(record["report"])
+    now = datetime.now(timezone.utc)
+    store.upsert_exception(
+        analysis_id=analysis_id, report_version=report_version,
+        finding_id=finding_id, reason=reason.strip(), expires_at=expires_dt,
+        created_by=created_by, now_ts=now)
+    decision = decide(record["report"],
+                      store.list_exceptions(analysis_id), now=now)
+    item = next(i for i in decision["items"]
+                if i["finding_id"] == finding_id)
+    return {
+        "registered": True,
+        "analysis_id": analysis_id,
+        "finding_id": finding_id,
+        "report_version": report_version,
+        "exception": item["exception"],
+        "exception_state": item["exception_state"],
+        "basis": item["basis"],
+        "verdict": decision["verdict"],
+        "verdict_label": decision["verdict_label"],
+        "summary": decision["summary"],
+        "stored": True,
+        "storage": store.status(),
+    }
+
+
+@router.get("/analyses/{analysis_id}/release-decision")
+def get_release_decision(analysis_id: str):
+    """查询逐项依据与「阻断 / 待核 / 可放行」总体裁决。
+
+    始终读取存储中的**完整报告 findings** 与全部历史例外（含已失效者，
+    随每项给出生效/失效原因）；页面严重度筛选与端点汇总不影响本结果。
+    """
+    record = _load_analysis_or_404(analysis_id)
+    exceptions = store.list_exceptions(analysis_id)
+    return decide(record["report"], exceptions)
+
+
+@router.get("/analyses/{analysis_id}/exceptions")
+def list_exceptions(analysis_id: str):
+    _load_analysis_or_404(analysis_id)
+    return {"analysis_id": analysis_id,
+            "exceptions": store.list_exceptions(analysis_id),
+            "storage": store.status()}
+
+
+@router.delete(
+    "/analyses/{analysis_id}/findings/{finding_id}/exception")
+def revoke_exception(analysis_id: str, finding_id: str):
+    """撤销当前报告版本上某个 finding 的例外。"""
+    record = _load_analysis_or_404(analysis_id)
+    report_version = report_version_of(record["report"])
+    ok = store.delete_exception(analysis_id, report_version, finding_id)
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail="当前报告版本上该 finding 没有已登记的例外")
+    return {"revoked": True, "analysis_id": analysis_id,
+            "finding_id": finding_id, "report_version": report_version}
 
 
 # --------------------------------------------------------------- 调用覆盖

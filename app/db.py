@@ -8,6 +8,7 @@ documented deployment (docker compose) always has Postgres available.
 from __future__ import annotations
 
 from typing import Any, Optional
+from datetime import timezone
 
 import psycopg
 from psycopg.types.json import Json
@@ -42,6 +43,27 @@ CREATE TABLE IF NOT EXISTS analysis_coverage (
     candidate   JSONB,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 发布放行例外：按 (分析 ID, 报告版本指纹, finding ID) 三元组绑定。
+-- 分析 ID 只由文档包内容决定，同 ID 重算会覆盖报告；绑定 report_version
+-- 使旧许可不会被新版本结论沿用。分析删除时级联清除。
+CREATE TABLE IF NOT EXISTS analysis_exceptions (
+    id              BIGSERIAL PRIMARY KEY,
+    analysis_id     TEXT NOT NULL
+                    REFERENCES analyses(id) ON DELETE CASCADE,
+    report_version  TEXT NOT NULL,
+    finding_id      TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    expires_at      TIMESTAMPTZ NOT NULL,
+    created_by      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT analysis_exceptions_uq
+        UNIQUE (analysis_id, report_version, finding_id)
+);
+
+CREATE INDEX IF NOT EXISTS analysis_exceptions_aid_idx
+    ON analysis_exceptions (analysis_id);
 """
 
 
@@ -266,6 +288,86 @@ class Database:
 
     def status(self) -> dict:
         return {"available": self.available, "error": self.last_error}
+
+    # ------------------------------------------------------- release exceptions
+    def list_exceptions(self, analysis_id: str) -> Optional[list[dict]]:
+        """Return all exceptions for an analysis (across report versions).
+
+        ``None`` signals a database failure so the facade can degrade.
+        """
+        if not self.available:
+            return None
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT finding_id, report_version, reason, "
+                        "expires_at, created_by, created_at, updated_at "
+                        "FROM analysis_exceptions WHERE analysis_id = %s "
+                        "ORDER BY created_at, id", (analysis_id,))
+                    rows = cur.fetchall()
+            return [{
+                "finding_id": r[0],
+                "report_version": r[1],
+                "reason": r[2],
+                "expires_at": r[3].astimezone(timezone.utc)
+                .isoformat() if r[3] else None,
+                "created_by": r[4],
+                "created_at": r[5].astimezone(timezone.utc)
+                .isoformat() if r[5] else None,
+                "updated_at": r[6].astimezone(timezone.utc)
+                .isoformat() if r[6] else None,
+            } for r in rows]
+        except Exception as exc:
+            self.last_error = str(exc)
+            return None
+
+    def upsert_exception(self, analysis_id: str, report_version: str,
+                         finding_id: str, reason: str, expires_at,
+                         created_by: Optional[str], now_ts) -> bool:
+        if not self.available:
+            return False
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO analysis_exceptions
+                            (analysis_id, report_version, finding_id, reason,
+                             expires_at, created_by, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (analysis_id, report_version, finding_id)
+                        DO UPDATE SET reason = EXCLUDED.reason,
+                                      expires_at = EXCLUDED.expires_at,
+                                      created_by = EXCLUDED.created_by,
+                                      updated_at = EXCLUDED.created_at
+                        -- created_at intentionally preserved on update
+                        """,
+                        (analysis_id, report_version, finding_id, reason,
+                         expires_at, created_by, now_ts, now_ts))
+                conn.commit()
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
+    def delete_exception(self, analysis_id: str, report_version: str,
+                         finding_id: str) -> bool:
+        if not self.available:
+            return False
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM analysis_exceptions WHERE analysis_id=%s "
+                        "AND report_version=%s AND finding_id=%s",
+                        (analysis_id, report_version, finding_id))
+                    deleted = cur.rowcount
+                conn.commit()
+            return bool(deleted)
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
 
 
 db = Database()

@@ -48,6 +48,11 @@ requestBody 被删除（`PARAMETER_MADE_REQUIRED` / `PARAMETER_ADDED_REQUIRED` /
   确定通过时其余分支的待定命中不再传播，嵌套属性的组合确定通过即正常
   计格（见下文「调用覆盖」）；结果随分析保存并确定性导出；
 - **确定性 JSON 导出**（键排序、无多余空白），响应头携带 SHA-256 指纹；
+- **契约发布放行裁决**：为指定 finding 登记「放行理由 + UTC 到期时间」的
+  例外，查询逐项依据与「**阻断 / 待核 / 可放行**」总体结果；裁决只读取完整
+  `report.findings` 的逐项严重度（不使用端点汇总、页面筛选或反例自检待定
+  状态），例外按**报告版本指纹**绑定——同分析 ID 重算报告、finding 消失或
+  例外到期时旧许可一律失效，未知 finding ID 拒绝登记；原报告与覆盖不被修改；
 - PostgreSQL 持久化分析记录与原始文档包（用于反例重放）；数据库不可用时
   自动降级为进程内存储；
 - Docker Compose 一键启动（Web + PostgreSQL）。
@@ -73,6 +78,10 @@ docker compose up --build
 节点的「无法判定」行与模式位置），或直接用下文的 HTTP API 上传/查询/导出。
 保存后的覆盖结论同样体现在 `GET /api/analyses/{id}/coverage/{side}` 与
 确定性导出中，页面、API、导出三者逐行一致。
+
+在「比对结果 → **发布放行**」标签中可为破坏性 / 无法判定 finding 登记放行
+例外（理由 + UTC 到期时间），查看逐项依据与总体裁决；也可直接调用下文的
+发布放行 HTTP API。例外数据随 PostgreSQL 持久化（降级时随内存存储）。
 
 
 ### 上传内容
@@ -115,6 +124,10 @@ pytest -q
 | `GET` | `/api/analyses/{id}` | 获取完整报告 |
 | `GET` | `/api/analyses/{id}/export?severity=breaking,undetermined` | 确定性 JSON 导出（可按严重度筛选；含已保存的调用覆盖） |
 | `POST` | `/api/analyses/{id}/findings/{fid}/replay` | 对反例（可在 body 中用 `{"instance": ...}` 覆盖）做双侧校验重放 |
+| `GET` | `/api/analyses/{id}/release-decision` | 查询发布放行裁决（逐项依据 + 阻断/待核/可放行） |
+| `PUT` | `/api/analyses/{id}/findings/{fid}/exception` | 为指定 finding 登记/更新放行例外（理由 + UTC 到期时间） |
+| `GET` | `/api/analyses/{id}/exceptions` | 列出该分析的全部例外（含旧版本/已失效条目） |
+| `DELETE` | `/api/analyses/{id}/findings/{fid}/exception` | 撤销当前报告版本上该 finding 的例外 |
 | `POST` | `/api/analyses/{id}/coverage/{side}` | 上传 NDJSON 调用记录，计算 `baseline`/`candidate` 侧调用覆盖 |
 | `GET` | `/api/analyses/{id}/coverage` | 查询两侧调用覆盖的可用性与汇总 |
 | `GET` | `/api/analyses/{id}/coverage/{side}` | 获取某侧完整调用覆盖文档（矩阵、缺口、逐行原因） |
@@ -305,6 +318,112 @@ curl -s "http://localhost:8000/api/analyses/$AID/export" -o report.json
 重复上传同一侧会**替换**旧结果；`DELETE` 删除指定侧；分析被删除时其覆盖一并删除。
 相同 NDJSON 输入永远产生字节一致的导出（含逐行原因，覆盖格只记录最早一行覆盖调用）。
 
+## 契约发布放行裁决（Release Gate）
+
+比对完成后，发布负责人需要回答：「**这批契约差异能不能放行发布？**」
+发布裁决在已有分析上工作，把**每一条 finding** 作为裁决单位，为需要业务接受的
+破坏性 / 无法判定 finding 登记有时限的放行例外。
+
+### 裁决规则
+
+服务端读取存储中的**完整 `report.findings`**（不经任何严重度筛选，也不读
+端点严重度汇总——一个端点可能同时含破坏性与兼容 finding；反例三态自检的
+「待定」只描述反例可否验证，同样不替代 finding 严重度）：
+
+1. 仍存在**无生效例外的破坏性 finding** → 总体裁决 **`blocked`（阻断）**；
+2. 否则仍存在**无生效例外的无法判定 finding** → **`needs_review`（待核）**；
+3. 两者都没有（原本就没有，或均被生效例外覆盖）→ **`releasable`（可放行）**。
+
+兼容项无需例外。每个条目都带逐项 `basis`（阻断 / 待核 / 例外生效 / 兼容的
+具体依据）；所有不生效的旧许可集中列在 `ineffective_exceptions` 并说明原因。
+
+### 例外的登记与版本绑定
+
+`PUT /api/analyses/{id}/findings/{fid}/exception`，请求体：
+
+```json
+{
+  "reason": "该枚举值仅内部租户使用，灰度期接受收窄风险",
+  "expires_at": "2027-03-01T12:00:00Z",
+  "created_by": "release-manager"
+}
+```
+
+- `reason`（必填）：放行理由；`expires_at`（必填）：**带时区的 ISO 8601**
+  UTC 到期时间（必须晚于当前 UTC 时间，不接受无时区时间与过去时间）；
+  `created_by` 可选。同一 finding 重复登记为**更新**（upsert）。
+- 例外按 **(分析 ID, 报告版本指纹, finding ID)** 三元组绑定，
+  `report_version` 是登记时刻完整报告的 SHA-256（即确定性导出指纹）。
+  **分析 ID 只由两份文档包内容计算**——同 ID 重新上传会覆盖报告，因此只按
+  分析 ID 关联会让重算后的新结论沿用旧许可；版本指纹不匹配的旧许可状态为
+  `stale_report_version`，不参与裁决，须在新版本上重新评审登记。
+- finding 在新报告中**消失**（`finding_absent`）、例外**超过 UTC 到期时间**
+  （`expired`）时旧许可同样不生效；为**未知 finding ID** 登记返回 `404`。
+- 登记/撤销例外**不修改原报告、findings 与确定性导出**；`DELETE` 可撤销
+  当前版本上某 finding 的例外（撤销后该项重新参与阻断 / 待核）。
+
+### 查询响应（节选）
+
+```bash
+curl -s "http://localhost:8000/api/analyses/$AID/release-decision"
+```
+
+```json
+{
+  "analysis_id": "83280dab7595b3a6",
+  "report_version": "7d347c3e…（完整报告 SHA-256）",
+  "decided_at": "2026-10-06T04:01:47+00:00",
+  "verdict": "blocked",
+  "verdict_label": "阻断",
+  "summary": {
+    "findings_total": 39, "breaking_total": 29, "undetermined_total": 5,
+    "compatible_total": 5,
+    "remaining_breaking": 28, "remaining_undetermined": 5,
+    "exceptions_active": 1, "exceptions_excepted_breaking": 1,
+    "exceptions_excepted_undetermined": 0,
+    "exceptions_expired": 0, "exceptions_stale_version": 0,
+    "exceptions_orphan": 0
+  },
+  "items": [
+    {
+      "finding_id": "1655e71cbeba", "rule": "ENUM_NARROWED",
+      "severity": "breaking",
+      "endpoint": {"path": "/pets", "method": "GET"},
+      "disposition": "releasable", "effective": true,
+      "exception_state": "active",
+      "exception": {"reason": "灰度期间接受枚举收窄风险",
+                    "expires_at": "2027-03-01T12:00:00+00:00",
+                    "created_by": "release-manager",
+                    "created_at": "…"},
+      "basis": "例外生效：…；UTC 到期 2027-03-01T12:00:00+00:00（绑定报告版本 7d347c3e…）"
+    }
+  ],
+  "ineffective_exceptions": [
+    {"finding_id": "…", "state": "stale_report_version",
+     "state_label": "版本失效",
+     "ineffective_reason": "例外绑定的报告版本已过期：分析 ID 相同但报告已重新计算…"}
+  ]
+}
+```
+
+`disposition` 取值：`blocked`（该项阻断）/ `needs_review`（待核）/
+`releasable`（兼容或被生效例外覆盖）。
+
+### 页面操作
+
+一键启动后打开 <http://localhost:8000/>，完成比对后切到
+「比对结果 → **发布放行**」标签：
+
+1. 顶部是总体裁决横幅（⛔ 阻断 / 🟠 待核 / ✅ 可放行）与当前**报告版本指纹**、
+   裁决时间；下方统计卡展示破坏性 / 无法判定总数与已豁免数、生效 / 过期 /
+   旧版本失效 / finding 消失的例外数；
+2. finding 分为「未豁免的破坏性项（阻断）」「未豁免的无法判定项（待核）」
+   「生效例外覆盖项」「兼容项」四组，每项显示端点、规则、严重度与逐项依据；
+3. 在阻断 / 待核项的表单中填写**放行理由**、选择 **UTC 到期时间**
+   （可选登记人）后「登记例外」，裁决实时重算；生效例外可一键「撤销」；
+4. 底部「已失效的旧许可」列出过期、报告重算后版本失配及 finding 消失的
+   历史许可及失效原因。页面严重度筛选只影响比对结果视图，不影响发布裁决。
+
 ## 判定规则（方向：基线 → 候选）
 
 ### 请求侧（不可收窄）
@@ -438,14 +557,15 @@ app/
     structuralreplay.py  # 结构性 finding（参数/请求体/状态码/媒体类型增删）的结构化反例与语义重放
     comparator.py        # 兼容性比较引擎与最小反例综合
     coverage.py          # 调用覆盖：NDJSON 解析、路径归属、参数/请求体/响应体约束核对、未支持关键字沿值判定、覆盖格
+    release.py           # 发布放行裁决：完整 findings 逐项依据、阻断/待核/可放行、例外版本绑定与失效判定
     replay.py            # 双侧重放校验（模式级 + 端点级）
     rules.py             # 规则目录与严重度
   analysis.py            # 编排：加载→比较→序列化→存储
   serialization.py       # 确定性 JSON 导出
-  db.py / store.py       # PostgreSQL 持久化 + 内存降级（含调用覆盖）
+  db.py / store.py       # PostgreSQL 持久化 + 内存降级（含调用覆盖与发布例外）
   static/                # 原生 JS 前端（无框架、无构建步骤）
 examples/                # 基线 / 候选示例文档包 + calls-baseline.ndjson 调用记录
-tests/                   # pytest（引擎/循环 32 项 + API 26 项 + 调用覆盖 52 项）
+tests/                   # pytest（引擎/循环 32 项 + API 26 项 + 调用覆盖 52 项 + 发布放行 21 项）
 ```
 
 ## 说明与边界

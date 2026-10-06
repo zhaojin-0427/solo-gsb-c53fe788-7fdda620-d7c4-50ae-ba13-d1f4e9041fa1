@@ -12,6 +12,7 @@ const state = {
   coverageSide: "baseline",
   coverageDocs: { baseline: null, candidate: null },
   coverageFile: null,
+  releaseDoc: null,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -137,11 +138,13 @@ function loadReport(doc) {
   state.analysisId = doc.analysis_id;
   state.findingsById = new Map(doc.findings.map((f) => [f.id, f]));
   state.coverageDocs = { baseline: null, candidate: null };
+  state.releaseDoc = null;
   $("#panel-result").hidden = false;
   $("#analysis-id").textContent = "#" + doc.analysis_id;
   $("#fingerprint").textContent = doc.fingerprint || "";
   render();
   loadCoverageSummaries();
+  loadReleaseDecision();
   $("#panel-result").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -163,17 +166,26 @@ function render() {
     $("#list-endpoints").hidden = false;
     $("#list-findings").hidden = true;
     $("#list-coverage").hidden = true;
+    $("#list-release").hidden = true;
     renderEndpoints(findings);
   } else if (state.view === "findings") {
     $("#list-endpoints").hidden = true;
     $("#list-findings").hidden = false;
     $("#list-coverage").hidden = true;
+    $("#list-release").hidden = true;
     renderFlat(findings);
-  } else {
+  } else if (state.view === "coverage") {
     $("#list-endpoints").hidden = true;
     $("#list-findings").hidden = true;
     $("#list-coverage").hidden = false;
+    $("#list-release").hidden = true;
     renderCoverage();
+  } else {
+    $("#list-endpoints").hidden = true;
+    $("#list-findings").hidden = true;
+    $("#list-coverage").hidden = true;
+    $("#list-release").hidden = false;
+    renderRelease();
   }
 }
 
@@ -848,6 +860,232 @@ async function removeCoverage() {
   if (resp.ok) {
     state.coverageDocs[side] = null;
     renderCoverage();
+  }
+}
+
+// ----------------------------------------------------- release gate
+const verdictMeta = {
+  blocked: { label: "阻断", cls: "rel-blocked",
+    icon: "⛔", hint: "仍存在未获生效例外的破坏性 finding，禁止发布" },
+  needs_review: { label: "待核", cls: "rel-review",
+    icon: "🟠", hint: "破坏性项已全部豁免，仍有无法判定 finding 待人工核实" },
+  releasable: { label: "可放行", cls: "rel-ok",
+    icon: "✅", hint: "无剩余破坏性 / 无法判定 finding，可以发布" },
+};
+
+async function loadReleaseDecision() {
+  if (!state.analysisId) return;
+  try {
+    const resp = await fetch(
+      `/api/analyses/${state.analysisId}/release-decision`);
+    if (!resp.ok) {
+      state.releaseDoc = null;
+      return;
+    }
+    state.releaseDoc = await resp.json();
+    if (state.view === "release") renderRelease();
+  } catch {
+    state.releaseDoc = null;
+  }
+}
+
+function renderRelease() {
+  const body = $("#release-body");
+  if (!state.releaseDoc) {
+    body.innerHTML = `<p class="hint">裁决加载中或不可用，可
+      <a href="#" id="rel-retry">点此重试</a>。</p>`;
+    const retry = $("#rel-retry");
+    if (retry) retry.addEventListener("click", (e) => {
+      e.preventDefault();
+      loadReleaseDecision();
+    });
+    return;
+  }
+  body.innerHTML = releaseHtml(state.releaseDoc);
+  body.querySelectorAll("[data-rel-action]").forEach((el) =>
+    el.addEventListener("click", () => releaseAction(el)));
+  body.querySelectorAll(".rel-form").forEach((form) =>
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      submitException(form.dataset.fid, form);
+    }));
+}
+
+function releaseHtml(doc) {
+  const v = verdictMeta[doc.verdict] || {};
+  const s = doc.summary || {};
+  const cards = [
+    ["finding 总数", s.findings_total, ""],
+    ["破坏性 / 已豁免", `${s.breaking_total} / ${s.exceptions_excepted_breaking}`,
+      s.remaining_breaking ? "rem" : ""],
+    ["无法判定 / 已豁免",
+      `${s.undetermined_total} / ${s.exceptions_excepted_undetermined}`,
+      s.remaining_undetermined ? "rem" : ""],
+    ["生效例外", s.exceptions_active, ""],
+    ["过期例外", s.exceptions_expired, ""],
+    ["旧版本失效", s.exceptions_stale_version, ""],
+    ["finding 消失失效", s.exceptions_orphan, ""],
+  ];
+  const cardsHtml = cards.map(([label, num, cls]) => `
+    <div class="cov-stat ${cls === "rem" ? "rel-rem" : ""}">
+      <span class="cov-stat-num">${num ?? 0}</span>
+      <span class="cov-stat-label">${label}</span>
+    </div>`).join("");
+
+  const groups = [
+    { key: "blocked", title: "未豁免的破坏性项（阻断）",
+      items: doc.items.filter((i) => i.disposition === "blocked") },
+    { key: "needs_review", title: "未豁免的无法判定项（待核）",
+      items: doc.items.filter((i) => i.disposition === "needs_review") },
+    { key: "excepted", title: "生效例外覆盖项",
+      items: doc.items.filter((i) => i.effective) },
+    { key: "compatible", title: "兼容项（无需例外）",
+      items: doc.items.filter((i) => i.severity === "compatible") },
+  ];
+  const groupsHtml = groups.map((g) => {
+    if (!g.items.length) return "";
+    return `<h4 class="cov-section-title">${escapeHtml(g.title)}
+        <span class="rel-count">${g.items.length}</span></h4>
+      <div class="rel-items">${g.items.map(relItemHtml).join("")}</div>`;
+  }).join("");
+
+  const stale = doc.ineffective_exceptions || [];
+  const staleHtml = stale.length ? `
+    <h4 class="cov-section-title">已失效的旧许可（不参与裁决）
+      <span class="rel-count">${stale.length}</span></h4>
+    <div class="rel-ineffective">${stale.map((e) => `
+      <div class="rel-stale-row">
+        <span class="count-pill sev-undetermined">${escapeHtml(e.state_label)}</span>
+        <code>${escapeHtml(e.finding_id)}</code>
+        <span class="rel-stale-reason">${escapeHtml(e.ineffective_reason)}</span>
+        <span class="hint">原理由：${escapeHtml(e.reason || "—")}；
+          到期 ${escapeHtml(e.expires_at || "—")}</span>
+      </div>`).join("")}</div>` : "";
+
+  return `
+    <div class="rel-verdict ${v.cls}">
+      <span class="rel-verdict-icon">${v.icon}</span>
+      <div>
+        <div class="rel-verdict-text">发布裁决：<b>${escapeHtml(v.label)}</b></div>
+        <div class="rel-verdict-hint">${escapeHtml(v.hint)}</div>
+      </div>
+      <span class="rel-version" title="完整报告的 SHA-256 指纹；同分析 ID 重算后变化">
+        报告版本 <code>${escapeHtml((doc.report_version || "").slice(0, 16))}…</code><br>
+        裁决时间 ${escapeHtml(doc.decided_at || "")}</span>
+    </div>
+    <div class="cov-stat-grid">${cardsHtml}</div>
+    ${groupsHtml || `<p class="hint">报告没有任何 finding。</p>`}
+    ${staleHtml}`;
+}
+
+function relItemHtml(item) {
+  const sev = sevClass[item.severity] || "";
+  const dispPill = {
+    blocked: '<span class="count-pill sev-breaking">阻断</span>',
+    needs_review: '<span class="count-pill sev-undetermined">待核</span>',
+    releasable: item.effective
+      ? '<span class="count-pill sev-compatible">例外生效</span>'
+      : '<span class="count-pill sev-compatible">兼容</span>',
+  }[item.disposition] || "";
+  const f = state.findingsById.get(item.finding_id) || {};
+  const loc = f.media_type
+    ? `${f.media_type}${f.status_code ? " · " + f.status_code : ""}`
+    : (f.location || "端点");
+  let body;
+  if (item.exception) {
+    body = `
+      <div class="rel-exc">
+        <div><b>放行理由：</b>${escapeHtml(item.exception.reason)}</div>
+        <div class="hint">UTC 到期：${escapeHtml(item.exception.expires_at)}
+          ${item.exception.created_by ? "· 登记人 "
+            + escapeHtml(item.exception.created_by) : ""}
+          · 登记于 ${escapeHtml(item.exception.created_at || "")}</div>
+        <div class="rel-basis">${escapeHtml(item.basis)}</div>
+        <button type="button" class="btn btn-ghost btn-sm"
+          data-rel-action="revoke" data-fid="${escapeHtml(item.finding_id)}">
+          撤销例外</button>
+      </div>`;
+  } else if (item.severity === "compatible") {
+    body = `<div class="rel-basis">${escapeHtml(item.basis)}</div>`;
+  } else {
+    body = `
+      <div class="rel-basis">${escapeHtml(item.basis)}</div>
+      <form class="rel-form" data-fid="${escapeHtml(item.finding_id)}">
+        <input type="text" class="rel-input rel-reason" required maxlength="500"
+          placeholder="放行理由（必填，说明为何可接受该破坏性 / 无法判定项）" />
+        <input type="datetime-local" class="rel-input rel-expires" required
+          step="1" title="UTC 到期时间（输入框按 UTC 解释）" />
+        <input type="text" class="rel-input rel-by" maxlength="100"
+          placeholder="登记人（可选）" />
+        <button type="submit" class="btn btn-primary btn-sm">登记例外</button>
+        <span class="error-text rel-err"></span>
+      </form>`;
+  }
+  return `
+    <div class="rel-item" data-rel-item="${escapeHtml(item.finding_id)}">
+      <div class="rel-item-head">
+        ${dispPill}
+        <span class="count-pill ${sev}">${sevLabel[item.severity] || item.severity}</span>
+        <span class="method ${methodClass(item.endpoint.method)}">${escapeHtml(item.endpoint.method || "")}</span>
+        <span class="ep-path">${escapeHtml(item.endpoint.path || "")}</span>
+        <code class="rel-rule">${escapeHtml(item.rule || "")}</code>
+        <span class="hint rel-loc">${escapeHtml(loc)}</span>
+        <code class="rel-fid" title="finding ID">${escapeHtml(item.finding_id)}</code>
+      </div>
+      <div class="rel-item-msg">${escapeHtml(item.message || "")}</div>
+      ${body}
+    </div>`;
+}
+
+async function submitException(fid, form) {
+  const reason = form.querySelector(".rel-reason").value.trim();
+  const dtRaw = form.querySelector(".rel-expires").value;
+  const createdBy = form.querySelector(".rel-by").value.trim();
+  const err = form.querySelector(".rel-err");
+  err.textContent = "";
+  if (!reason) {
+    err.textContent = "请填写放行理由";
+    return;
+  }
+  if (!dtRaw) {
+    err.textContent = "请选择 UTC 到期时间";
+    return;
+  }
+  // datetime-local 不带时区；按页面承诺一律解释为 UTC
+  const expiresAt = dtRaw.length === 16 ? `${dtRaw}:00Z` : `${dtRaw}Z`;
+  const payload = { reason, expires_at: expiresAt };
+  if (createdBy) payload.created_by = createdBy;
+  const btn = form.querySelector("button[type=submit]");
+  btn.disabled = true;
+  btn.textContent = "登记中…";
+  try {
+    const resp = await fetch(
+      `/api/analyses/${state.analysisId}/findings/${fid}/exception`,
+      { method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload) });
+    if (!resp.ok) {
+      const e = await resp.json().catch(() => ({}));
+      throw new Error(e.detail || `HTTP ${resp.status}`);
+    }
+    await loadReleaseDecision();
+  } catch (exc) {
+    err.textContent = "登记失败：" + exc.message;
+    btn.disabled = false;
+    btn.textContent = "登记例外";
+  }
+}
+
+async function releaseAction(el) {
+  const fid = el.dataset.fid;
+  if (el.dataset.relAction === "revoke") {
+    if (!confirm("撤销该 finding 的生效例外？撤销后该项将重新参与阻断 / 待核裁决。"))
+      return;
+    el.disabled = true;
+    const resp = await fetch(
+      `/api/analyses/${state.analysisId}/findings/${fid}/exception`,
+      { method: "DELETE" });
+    if (resp.ok) await loadReleaseDecision();
+    else el.disabled = false;
   }
 }
 
