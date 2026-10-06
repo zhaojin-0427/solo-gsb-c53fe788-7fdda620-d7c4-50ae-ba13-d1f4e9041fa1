@@ -586,3 +586,135 @@ def test_example_package_structural_replays(client, analysis_id):
         assert "error" not in body
         assert body["structural_check"]["baseline"]
         assert body["structural_check"]["candidate"]
+
+
+# ------------------------------------------------------------- release gate
+def test_release_gate_uses_complete_findings_and_exceptions(client,
+                                                             analysis_id):
+    report = client.get(f"/api/analyses/{analysis_id}").json()
+    breaking = next(f for f in report["findings"]
+                    if f["severity"] == "breaking")
+    undetermined = next(f for f in report["findings"]
+                        if f["severity"] == "undetermined")
+
+    gate = client.get(
+        f"/api/analyses/{analysis_id}/release-decision").json()
+    assert gate["decision"] == "blocked"
+    assert gate["evaluation"]["severity_source"] == \
+        "report.findings[*].severity"
+    assert gate["evaluation"]["endpoint_summary_used"] is False
+    assert gate["evaluation"]["filtered_findings_used"] is False
+    assert gate["evaluation"]["witness_self_check_used_as_severity"] is False
+    assert len(gate["items"]) == len(report["findings"])
+
+    r = client.put(
+        f"/api/analyses/{analysis_id}/release-exceptions/{breaking['id']}",
+        json={"reason": "已确认兼容窗口内灰度",
+              "expires_at": "3000-01-01T00:00:00Z"})
+    assert r.status_code == 200, r.text
+    assert r.json()["exception"]["report_version"] == \
+        report["report_version"]
+    gate = r.json()["decision"]
+    assert gate["decision"] == "pending_review"
+    assert gate["summary"]["waived_breaking"] >= 1
+    assert gate["summary"]["remaining_breaking"] < gate["summary"]["breaking"]
+
+    r = client.put(
+        f"/api/analyses/{analysis_id}/release-exceptions/"
+        f"{undetermined['id']}",
+        json={"reason": "人工复核完成", "expires_at": "3000-01-01T00:00:00Z"})
+    assert r.status_code == 200, r.text
+    assert r.json()["decision"]["decision"] == "releasable"
+
+
+def test_release_exception_rejects_unknown_finding_and_bad_expiry(client,
+                                                                  analysis_id):
+    r = client.put(
+        f"/api/analyses/{analysis_id}/release-exceptions/unknown",
+        json={"reason": "x", "expires_at": "3000-01-01T00:00:00Z"})
+    assert r.status_code == 404
+
+    report = client.get(f"/api/analyses/{analysis_id}").json()
+    fid = next(f["id"] for f in report["findings"]
+               if f["severity"] == "breaking")
+    r = client.put(
+        f"/api/analyses/{analysis_id}/release-exceptions/{fid}",
+        json={"reason": "x", "expires_at": "2000-01-01T00:00:00Z"})
+    assert r.status_code == 400
+
+    r = client.put(
+        f"/api/analyses/{analysis_id}/release-exceptions/{fid}",
+        json={"reason": "x", "expires_at": "3000-01-01T00:00:00"})
+    assert r.status_code == 400
+
+
+def test_release_exception_is_bound_to_recomputed_report_version(
+        client, monkeypatch):
+    import copy
+    from app.api import routes
+    from app.serialization import findings_version
+
+    r = client.post(
+        "/api/analyses",
+        files={
+            "baseline": ("b.zip", _zip_bytes("examples/baseline"),
+                         "application/zip"),
+            "candidate": ("c.zip", _zip_bytes("examples/candidate"),
+                          "application/zip"),
+        })
+    assert r.status_code == 201, r.text
+    first = r.json()
+    aid = first["analysis_id"]
+    fid = next(f["id"] for f in first["findings"]
+               if f["severity"] == "breaking")
+    old_version = first["report_version"]
+
+    r = client.put(f"/api/analyses/{aid}/release-exceptions/{fid}",
+                   json={"reason": "old report approval",
+                         "expires_at": "3000-01-01T00:00:00Z"})
+    assert r.status_code == 200, r.text
+
+    original_analyze = routes.analyze
+
+    def recomputed_analyze(*args, **kwargs):
+        result = original_analyze(*args, **kwargs)
+        changed = copy.deepcopy(result)
+        target = next(f for f in changed["report_doc"]["findings"]
+                      if f["id"] == fid)
+        target["rule_detail"] = target["rule_detail"] + "（重算后补充依据）"
+        changed["report_doc"]["report_version"] = findings_version(
+            changed["report_doc"]["findings"])
+        return changed
+
+    monkeypatch.setattr(routes, "analyze", recomputed_analyze)
+    r = client.post(
+        "/api/analyses",
+        files={
+            "baseline": ("b.zip", _zip_bytes("examples/baseline"),
+                         "application/zip"),
+            "candidate": ("c.zip", _zip_bytes("examples/candidate"),
+                          "application/zip"),
+        })
+    assert r.status_code == 201, r.text
+    assert r.json()["analysis_id"] == aid
+    assert r.json()["report_version"] != old_version
+
+    gate = client.get(f"/api/analyses/{aid}/release-decision").json()
+    item = next(x for x in gate["items"] if x["finding_id"] == fid)
+    assert item["active_exception"] is None
+    assert item["stale_exceptions"]
+    assert item["stale_exceptions"][0]["state"] == "stale"
+    assert "已重算" in item["reason"]
+    assert gate["summary"]["exceptions_stale"] >= 1
+
+    monkeypatch.undo()
+    r = client.post(
+        "/api/analyses",
+        files={
+            "baseline": ("b.zip", _zip_bytes("examples/baseline"),
+                         "application/zip"),
+            "candidate": ("c.zip", _zip_bytes("examples/candidate"),
+                          "application/zip"),
+        })
+    assert r.status_code == 201, r.text
+    assert r.json()["report_version"] == old_version

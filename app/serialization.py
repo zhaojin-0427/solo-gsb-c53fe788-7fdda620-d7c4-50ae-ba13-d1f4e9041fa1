@@ -13,6 +13,12 @@ from .services.comparator import Report, Finding
 SCHEMA_VERSION = "1.0"
 
 
+def findings_version(findings: list[dict[str, Any]]) -> str:
+    """Content version for a complete serialized findings list."""
+    return hashlib.sha256(
+        canonical_json(findings).encode("utf-8")).hexdigest()
+
+
 def _loc(ctx, loc: FacetLoc | None) -> str | None:
     return ctx.hint(loc)
 
@@ -57,6 +63,11 @@ def report_to_dict(report: Report, *, baseline_meta: dict | None = None,
         ("finding_ids", list(e.finding_ids)),
     ]) for e in report.endpoints]
 
+    # Version only the complete rule-hit payload. Endpoint aggregates are
+    # deliberately not included so endpoint recomputation cannot hide a
+    # changed finding set.
+    report_version_id = findings_version(findings)
+
     counts = {"breaking": 0, "undetermined": 0, "compatible": 0}
     for f in report.findings:
         counts[f.severity] += 1
@@ -64,6 +75,7 @@ def report_to_dict(report: Report, *, baseline_meta: dict | None = None,
     doc = OrderedDict()
     doc["schema_version"] = SCHEMA_VERSION
     doc["analysis_id"] = analysis_id
+    doc["report_version"] = report_version_id
     doc["generated_by"] = "OpenAPI Contract Evolution Workbench"
     doc["packages"] = OrderedDict([
         ("baseline", baseline_meta or {}),

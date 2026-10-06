@@ -48,6 +48,9 @@ requestBody 被删除（`PARAMETER_MADE_REQUIRED` / `PARAMETER_ADDED_REQUIRED` /
   确定通过时其余分支的待定命中不再传播，嵌套属性的组合确定通过即正常
   计格（见下文「调用覆盖」）；结果随分析保存并确定性导出；
 - **确定性 JSON 导出**（键排序、无多余空白），响应头携带 SHA-256 指纹；
+- **契约发布放行裁决**：对完整 `report.findings` 逐项登记带理由与 UTC 到期时间
+  的例外，返回「阻断 / 待核 / 可放行」及每项生效或失效原因；例外绑定报告版本，
+  报告重算、finding 消失或例外过期后旧许可不会继续生效；
 - PostgreSQL 持久化分析记录与原始文档包（用于反例重放）；数据库不可用时
   自动降级为进程内存储；
 - Docker Compose 一键启动（Web + PostgreSQL）。
@@ -63,6 +66,7 @@ docker compose up --build
 启动后访问：
 
 - 工作台页面：<http://localhost:8000/>
+- 发布放行页面：打开工作台 →「比对结果」→「发布放行」标签
 - API 文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/api/health>
 
@@ -73,6 +77,10 @@ docker compose up --build
 节点的「无法判定」行与模式位置），或直接用下文的 HTTP API 上传/查询/导出。
 保存后的覆盖结论同样体现在 `GET /api/analyses/{id}/coverage/{side}` 与
 确定性导出中，页面、API、导出三者逐行一致。
+
+也可在页面「比对结果 → **发布放行**」标签中查看完整 findings 的逐项依据、
+为指定破坏性或无法判定 finding 填写理由和 UTC 到期时间，顶部会显示
+**阻断 / 待核 / 可放行**；或直接调用下文的发布裁决 HTTP API。
 
 
 ### 上传内容
@@ -114,6 +122,8 @@ pytest -q
 | `GET` | `/api/analyses` | 历史分析列表 |
 | `GET` | `/api/analyses/{id}` | 获取完整报告 |
 | `GET` | `/api/analyses/{id}/export?severity=breaking,undetermined` | 确定性 JSON 导出（可按严重度筛选；含已保存的调用覆盖） |
+| `GET` | `/api/analyses/{id}/release-decision` | 查询契约发布裁决、逐项依据、例外生效/失效原因 |
+| `PUT` | `/api/analyses/{id}/release-exceptions/{fid}` | 为指定 finding 登记/更新带理由与 UTC 到期时间的例外（也兼容 `POST`） |
 | `POST` | `/api/analyses/{id}/findings/{fid}/replay` | 对反例（可在 body 中用 `{"instance": ...}` 覆盖）做双侧校验重放 |
 | `POST` | `/api/analyses/{id}/coverage/{side}` | 上传 NDJSON 调用记录，计算 `baseline`/`candidate` 侧调用覆盖 |
 | `GET` | `/api/analyses/{id}/coverage` | 查询两侧调用覆盖的可用性与汇总 |
@@ -127,6 +137,65 @@ pytest -q
 
 - `Content-Disposition: attachment; filename="contract-report-<id>-<severity>.json"`
 - `X-Report-Fingerprint: <sha256>`（与导出字节一一对应，可用于校验确定性）
+
+## 契约发布放行裁决（Release Gate）
+
+裁决固定读取当前完整 `report.findings`，逐项使用 finding 自身的
+`severity`：
+
+1. 仍有未被有效例外覆盖的 **breaking** → `blocked`（阻断）；
+2. breaking 均已处理，但仍有未被有效例外覆盖的 **undetermined**
+   → `pending_review`（待核）；
+3. 两类剩余项均为 0 → `releasable`（可放行）。
+
+端点严重度只是聚合视图；页面严重度/文本筛选只改变可见项；反例自检的
+`pending` 只说明生成的反例仍有未决校验因素。它们都**不能替代 finding 的
+`severity`**。兼容项（`compatible`）不参与发布阻断或待核计数。
+
+每个例外包含：
+
+- `reason`：非空理由；
+- `expires_at`：ISO 8601 到期时间，**必须带时区**；UTC 可写作
+  `2030-01-01T00:00:00Z` 或 `2030-01-01T00:00:00+00:00`；
+- 绑定键：`analysis_id + report_version + finding_id`。
+
+`report_version` 是完整 `report.findings` 内容的 SHA-256。分析 ID 只由基线
+与候选文档包内容计算，因此同两份文档包在比较器更新后重算会得到**相同分析
+ID、不同 report_version** 并覆盖原报告；旧例外会标记为 `stale`，不会让新
+结论沿用旧许可。finding 在当前版本中消失时，对应例外为
+`missing_finding`；到期时间已过为 `expired`；只有同时匹配当前报告版本、
+finding ID 且未过期时才为 `active`。未知 finding ID 的登记请求会被拒绝
+（`404`）。裁决和登记例外只读取/写入发布许可数据，不会修改原始比对报告
+或已保存的调用覆盖。
+
+查询裁决：
+
+```bash
+curl -s "http://localhost:8000/api/analyses/$AID/release-decision" \
+  -o release-decision.json
+```
+
+登记或更新某个 finding 的例外：
+
+```bash
+FID=$(python3 -c 'import json; d=json.load(open("/tmp/report.json")); print(next(f["id"] for f in d["findings"] if f["severity"] == "breaking"))')
+
+curl -s -X PUT \
+  "http://localhost:8000/api/analyses/$AID/release-exceptions/$FID" \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"已确认灰度窗口内无旧客户端调用","expires_at":"2030-01-01T00:00:00Z"}'
+```
+
+响应中的 `decision.decision` 为 `blocked` / `pending_review` /
+`releasable`，`decision.items[]` 给出每个 finding 的严重度来源、裁决处理
+（`blocked` / `pending_review` / `waived` / `not_gating`）及具体原因；
+`decision.exceptions[]` 保留每项登记记录的 `active` / `expired` / `stale`
+/ `missing_finding` 状态与原因，便于审计。
+
+页面使用方式：上传或打开历史分析后，进入「**发布放行**」标签。该页面不受
+顶部严重度或文本筛选影响，始终展示完整 findings；在破坏性/无法判定项右侧
+填写理由和 UTC 到期时间，点击「登记例外」即可，顶部裁决与逐项原因会即时
+刷新。
 
 ## 调用覆盖（Call Coverage）
 
@@ -438,11 +507,12 @@ app/
     structuralreplay.py  # 结构性 finding（参数/请求体/状态码/媒体类型增删）的结构化反例与语义重放
     comparator.py        # 兼容性比较引擎与最小反例综合
     coverage.py          # 调用覆盖：NDJSON 解析、路径归属、参数/请求体/响应体约束核对、未支持关键字沿值判定、覆盖格
+    release.py           # 发布放行裁决：完整 findings、例外版本绑定、过期/重算原因
     replay.py            # 双侧重放校验（模式级 + 端点级）
     rules.py             # 规则目录与严重度
   analysis.py            # 编排：加载→比较→序列化→存储
   serialization.py       # 确定性 JSON 导出
-  db.py / store.py       # PostgreSQL 持久化 + 内存降级（含调用覆盖）
+  db.py / store.py       # PostgreSQL 持久化 + 内存降级（含调用覆盖、发布例外）
   static/                # 原生 JS 前端（无框架、无构建步骤）
 examples/                # 基线 / 候选示例文档包 + calls-baseline.ndjson 调用记录
 tests/                   # pytest（引擎/循环 32 项 + API 26 项 + 调用覆盖 52 项）

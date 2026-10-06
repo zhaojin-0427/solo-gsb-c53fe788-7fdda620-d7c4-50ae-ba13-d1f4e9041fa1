@@ -12,6 +12,7 @@ const state = {
   coverageSide: "baseline",
   coverageDocs: { baseline: null, candidate: null },
   coverageFile: null,
+  releaseDoc: null,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -137,6 +138,7 @@ function loadReport(doc) {
   state.analysisId = doc.analysis_id;
   state.findingsById = new Map(doc.findings.map((f) => [f.id, f]));
   state.coverageDocs = { baseline: null, candidate: null };
+  state.releaseDoc = null;
   $("#panel-result").hidden = false;
   $("#analysis-id").textContent = "#" + doc.analysis_id;
   $("#fingerprint").textContent = doc.fingerprint || "";
@@ -162,16 +164,25 @@ function render() {
   if (state.view === "endpoints") {
     $("#list-endpoints").hidden = false;
     $("#list-findings").hidden = true;
+    $("#list-release").hidden = true;
     $("#list-coverage").hidden = true;
     renderEndpoints(findings);
   } else if (state.view === "findings") {
     $("#list-endpoints").hidden = true;
     $("#list-findings").hidden = false;
+    $("#list-release").hidden = true;
     $("#list-coverage").hidden = true;
     renderFlat(findings);
+  } else if (state.view === "release") {
+    $("#list-endpoints").hidden = true;
+    $("#list-findings").hidden = true;
+    $("#list-release").hidden = false;
+    $("#list-coverage").hidden = true;
+    renderRelease();
   } else {
     $("#list-endpoints").hidden = true;
     $("#list-findings").hidden = true;
+    $("#list-release").hidden = true;
     $("#list-coverage").hidden = false;
     renderCoverage();
   }
@@ -644,6 +655,187 @@ function formatPtr(f, side) {
   if (!pointer) return "—";
   const sameFile = !file || file === state.report.packages[side]?.entry;
   return sameFile ? "#" + pointer : `${file}#${pointer}`;
+}
+
+// ----------------------------------------------------- release gate
+const releaseMeta = {
+  blocked: { label: "阻断", cls: "release-blocked" },
+  pending_review: { label: "待核", cls: "release-pending" },
+  releasable: { label: "可放行", cls: "release-ok" },
+};
+const treatmentMeta = {
+  blocked: { label: "剩余破坏性 · 阻断", cls: "release-blocked" },
+  pending_review: { label: "剩余无法判定 · 待核", cls: "release-pending" },
+  waived: { label: "例外生效 · 已放行", cls: "release-waived" },
+  not_gating: { label: "兼容 · 不参与裁决", cls: "release-na" },
+};
+
+function defaultExpiresInput() {
+  const d = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  d.setSeconds(0, 0);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T`
+    + `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+
+async function renderRelease() {
+  const box = $("#list-release");
+  box.hidden = false;
+  box.innerHTML = `<p class="hint">正在读取完整 findings 并计算发布裁决…</p>`;
+  let doc;
+  try {
+    const resp = await fetch(
+      `/api/analyses/${state.analysisId}/release-decision`);
+    if (!resp.ok) {
+      const e = await resp.json().catch(() => ({}));
+      throw new Error(e.detail || `HTTP ${resp.status}`);
+    }
+    doc = await resp.json();
+    state.releaseDoc = doc;
+  } catch (exc) {
+    box.innerHTML = `<div class="replay-result replay-bad">发布裁决加载失败：${escapeHtml(exc.message)}</div>`;
+    return;
+  }
+  box.innerHTML = releaseHtml(doc);
+  bindReleaseForms();
+}
+
+function releaseHtml(doc) {
+  const meta = releaseMeta[doc.decision] || releaseMeta.pending_review;
+  const s = doc.summary || {};
+  const cards = [
+    ["完整 findings", s.total_findings ?? 0],
+    ["破坏性", s.breaking ?? 0],
+    ["无法判定", s.undetermined ?? 0],
+    ["剩余破坏性", s.remaining_breaking ?? 0],
+    ["剩余无法判定", s.remaining_undetermined ?? 0],
+    ["生效例外", s.exceptions_active ?? 0],
+  ].map(([label, num]) => `
+    <div class="cov-stat">
+      <span class="cov-stat-num">${num}</span>
+      <span class="cov-stat-label">${label}</span>
+    </div>`).join("");
+
+  const rows = (doc.items || []).map((item) => {
+    const tm = treatmentMeta[item.treatment] || treatmentMeta.not_gating;
+    const active = item.active_exception;
+    const expired = item.current_version_exception;
+    const stale = item.stale_exceptions || [];
+    const formNeeded = item.severity === "breaking"
+      || item.severity === "undetermined";
+    const staleHtml = stale.length
+      ? `<div class="release-exception-note">${stale.slice(0, 2).map((x) =>
+          escapeHtml(x.reason)).join("<br>")}</div>`
+      : "";
+    const expiredHtml = expired && !active
+      ? `<div class="release-exception-note">${escapeHtml(expired.reason)}</div>`
+      : "";
+    const activeHtml = active
+      ? `<div class="release-exception-note release-active-note">
+           当前例外生效：${escapeHtml(active.registered_reason || "")}<br>
+           依据：${escapeHtml(active.reason)}<br>
+           UTC 到期：${escapeHtml(active.expires_at)}
+         </div>`
+      : "";
+    return `<tr>
+      <td><span class="release-badge ${tm.cls}">${tm.label}</span></td>
+      <td><span class="sev-dot ${dotClass[item.severity]}"></span>${sevLabel[item.severity] || item.severity}</td>
+      <td><span class="method ${methodClass(item.endpoint?.method || "")}">${escapeHtml(item.endpoint?.method || "")}</span>
+          <code>${escapeHtml(item.endpoint?.path || "")}</code><br>
+          <small>${escapeHtml(item.rule || "")} · <code>${escapeHtml(item.finding_id)}</code></small></td>
+      <td class="release-message">${escapeHtml(item.message || "")}
+        <div class="release-reason">${escapeHtml(item.reason || "")}</div>
+        ${activeHtml}${expiredHtml}${staleHtml}
+      </td>
+      <td>${formNeeded ? `
+        <form class="release-exception-form" data-fid="${escapeHtml(item.finding_id)}">
+          <textarea name="reason" rows="2" placeholder="登记放行理由（必填）" required>${active ? escapeHtml(active.registered_reason || "") : ""}</textarea>
+          <label class="utc-label">UTC 到期时间
+            <input type="datetime-local" name="expires_at" required value="${active ? escapeHtml(active.expires_at.slice(0, 16)) : defaultExpiresInput()}" />
+          </label>
+          <button class="btn btn-primary btn-sm" type="submit">${active ? "更新例外" : "登记例外"}</button>
+          <div class="release-form-msg"></div>
+        </form>` : "—"}
+      </td>
+    </tr>`;
+  }).join("");
+
+  const orphanRows = (doc.exceptions || [])
+    .filter((x) => x.state === "missing_finding")
+    .map((x) => `<li><code>${escapeHtml(x.finding_id)}</code>：${escapeHtml(x.reason)}</li>`)
+    .join("");
+  const audit = orphanRows
+    ? `<h4 class="cov-section-title">已失效/不可用的登记记录</h4><ul class="release-audit">${orphanRows}</ul>`
+    : "";
+
+  return `
+    <div class="release-hero ${meta.cls}">
+      <div>
+        <h3>发布裁决：${meta.label}</h3>
+        <p>${escapeHtml(doc.reason || "")}</p>
+        <p class="hint">判定时间 UTC <code>${escapeHtml(doc.decided_at || "")}</code>
+          · 当前报告版本 <code title="${escapeHtml(doc.report_version || "")}">${escapeHtml((doc.report_version || "").slice(0, 16))}</code></p>
+      </div>
+    </div>
+    <div class="release-source-note">
+      裁决固定读取服务端完整 <code>report.findings</code>；不使用端点汇总、页面筛选结果，
+      也不把反例自检的 <code>pending</code> 状态当作 finding 严重度。
+      例外绑定键为 <code>analysis_id + report_version + finding_id</code>。
+    </div>
+    <div class="cov-stat-grid">${cards}</div>
+    <h4 class="cov-section-title">逐项依据与例外登记</h4>
+    <div class="release-table-wrap">
+      <table class="release-table">
+        <thead><tr><th>裁决项</th><th>严重度</th><th>端点 / 规则</th><th>依据与原因</th><th>例外（理由 + UTC 到期）</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    ${audit}`;
+}
+
+function bindReleaseForms() {
+  $$(".release-exception-form").forEach((form) => {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fid = form.dataset.fid;
+      const msg = form.querySelector(".release-form-msg");
+      const btn = form.querySelector("button");
+      const reason = new FormData(form).get("reason").trim();
+      const local = new FormData(form).get("expires_at");
+      if (!reason) {
+        msg.textContent = "请填写理由。";
+        msg.className = "release-form-msg error-text";
+        return;
+      }
+      if (!local) {
+        msg.textContent = "请填写 UTC 到期时间。";
+        msg.className = "release-form-msg error-text";
+        return;
+      }
+      btn.disabled = true;
+      msg.textContent = "提交中…";
+      msg.className = "release-form-msg hint";
+      try {
+        const resp = await fetch(
+          `/api/analyses/${state.analysisId}/release-exceptions/${fid}`,
+          { method: "PUT", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reason, expires_at: local + ":00Z" }) });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${resp.status}`);
+        }
+        const body = await resp.json();
+        state.releaseDoc = body.decision;
+        const box = $("#list-release");
+        box.innerHTML = releaseHtml(body.decision);
+        bindReleaseForms();
+      } catch (exc) {
+        msg.textContent = "登记失败：" + exc.message;
+        msg.className = "release-form-msg error-text";
+        btn.disabled = false;
+      }
+    });
+  });
 }
 
 // ----------------------------------------------------- call coverage

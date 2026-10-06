@@ -42,6 +42,20 @@ CREATE TABLE IF NOT EXISTS analysis_coverage (
     candidate   JSONB,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS release_exceptions (
+    analysis_id     TEXT NOT NULL
+                    REFERENCES analyses(id) ON DELETE CASCADE,
+    report_version  TEXT NOT NULL,
+    finding_id      TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    expires_at      TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (analysis_id, report_version, finding_id)
+);
+
+CREATE INDEX IF NOT EXISTS release_exceptions_analysis_idx
+    ON release_exceptions (analysis_id, report_version);
 """
 
 
@@ -263,6 +277,64 @@ class Database:
         except Exception as exc:
             self.last_error = str(exc)
             return False
+
+    def save_release_exception(self, exception: dict) -> bool:
+        if not self.available:
+            return False
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO release_exceptions
+                            (analysis_id, report_version, finding_id, reason,
+                             expires_at, created_at)
+                        VALUES (%s, %s, %s, %s, %s, COALESCE(%s::timestamptz, now()))
+                        ON CONFLICT (analysis_id, report_version, finding_id)
+                        DO UPDATE SET
+                            reason = EXCLUDED.reason,
+                            expires_at = EXCLUDED.expires_at,
+                            created_at = now()
+                        """,
+                        (exception["analysis_id"],
+                         exception["report_version"],
+                         exception["finding_id"],
+                         exception["reason"],
+                         exception["expires_at"],
+                         exception.get("created_at")))
+                conn.commit()
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
+    def list_release_exceptions(self, analysis_id: str) -> list[dict[str, Any]]:
+        if not self.available:
+            return []
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT analysis_id, report_version, finding_id, reason,
+                               expires_at, created_at
+                        FROM release_exceptions
+                        WHERE analysis_id = %s
+                        ORDER BY created_at DESC, finding_id, report_version
+                        """,
+                        (analysis_id,))
+                    rows = cur.fetchall()
+            return [{
+                "analysis_id": r[0],
+                "report_version": r[1],
+                "finding_id": r[2],
+                "reason": r[3],
+                "expires_at": r[4].isoformat() if r[4] else None,
+                "created_at": r[5].isoformat() if r[5] else None,
+            } for r in rows]
+        except Exception as exc:
+            self.last_error = str(exc)
+            return []
 
     def status(self) -> dict:
         return {"available": self.available, "error": self.last_error}

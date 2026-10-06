@@ -18,6 +18,7 @@ class _MemoryStore:
         self._analyses: dict[str, dict] = {}
         self._packages: dict[str, dict] = {}
         self._coverage: dict[str, dict] = {}
+        self._release_exceptions: dict[tuple[str, str, str], dict] = {}
 
     @property
     def available(self) -> bool:
@@ -70,12 +71,26 @@ class _MemoryStore:
             if entry:
                 entry.pop(side, None)
 
+    def save_release_exception(self, exception: dict) -> None:
+        key = (exception["analysis_id"], exception["report_version"],
+               exception["finding_id"])
+        with self._lock:
+            self._release_exceptions[key] = dict(exception)
+
+    def list_release_exceptions(self, analysis_id: str) -> list[dict]:
+        with self._lock:
+            return [dict(v) for k, v in self._release_exceptions.items()
+                    if k[0] == analysis_id]
+
     def delete(self, analysis_id: str) -> bool:
         with self._lock:
             existed = analysis_id in self._analyses
             self._analyses.pop(analysis_id, None)
             self._packages.pop(analysis_id, None)
             self._coverage.pop(analysis_id, None)
+            for key in [k for k in self._release_exceptions
+                        if k[0] == analysis_id]:
+                self._release_exceptions.pop(key, None)
         return existed
 
 
@@ -162,6 +177,27 @@ class Store:
             self.db.delete_coverage(analysis_id, side)
         else:
             _memory.delete_coverage(analysis_id, side)
+
+    def save_release_exception(self, exception: dict) -> None:
+        if self.db.available:
+            ok = self.db.save_release_exception(exception)
+            if not ok:
+                _memory.save_release_exception(exception)
+        else:
+            _memory.save_release_exception(exception)
+
+    def list_release_exceptions(self, analysis_id: str) -> list[dict]:
+        if self.db.available:
+            rows = self.db.list_release_exceptions(analysis_id)
+            # Do not silently lose audit history if the database drops during
+            # a request: combine with any degraded in-memory rows.
+            seen = {(r["analysis_id"], r["report_version"],
+                     r["finding_id"]) for r in rows}
+            rows.extend(r for r in _memory.list_release_exceptions(analysis_id)
+                        if (r["analysis_id"], r["report_version"],
+                            r["finding_id"]) not in seen)
+            return rows
+        return _memory.list_release_exceptions(analysis_id)
 
     def delete(self, analysis_id: str) -> bool:
         if self.db.available:

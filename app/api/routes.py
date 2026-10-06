@@ -1,11 +1,14 @@
 from fastapi import APIRouter, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from datetime import datetime, timezone
+from pydantic import BaseModel, Field
 
 from ..analysis import analyze, filter_report, from_envelope
 from ..config import settings
 from ..services.loader import PackageError
 from ..services.coverage import CoverageError, build_coverage
+from ..services.release import build_release_decision, iso_utc, parse_datetime, \
+    report_version, utc_now
 from ..services.replay import replay
 from ..store import store
 
@@ -13,6 +16,11 @@ router = APIRouter(prefix="/api")
 
 SEVERITY_VALUES = {"breaking", "undetermined", "compatible"}
 COVERAGE_SIDES = ("baseline", "candidate")
+
+
+class ReleaseExceptionIn(BaseModel):
+    reason: str = Field(min_length=1)
+    expires_at: str
 
 
 @router.get("/health")
@@ -125,6 +133,59 @@ def export_analysis(analysis_id: str, severity: str | None = None):
         headers={"Content-Disposition":
                  f'attachment; filename="{filename}"',
                  "X-Report-Fingerprint": _fingerprint(payload)})
+
+
+@router.get("/analyses/{analysis_id}/release-decision")
+def get_release_decision(analysis_id: str):
+    record = store.get(analysis_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="分析不存在")
+    exceptions = store.list_release_exceptions(analysis_id)
+    return build_release_decision(record["report"], exceptions)
+
+
+@router.put("/analyses/{analysis_id}/release-exceptions/{finding_id}")
+@router.post("/analyses/{analysis_id}/release-exceptions/{finding_id}")
+def register_release_exception(analysis_id: str, finding_id: str,
+                               payload: ReleaseExceptionIn):
+    record = store.get(analysis_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="分析不存在")
+    report = record["report"]
+    finding = next((f for f in report.get("findings", [])
+                    if f.get("id") == finding_id), None)
+    if not finding:
+        raise HTTPException(
+            status_code=404,
+            detail=("finding 不存在：例外只能登记到当前完整 report.findings "
+                    f"中存在的 ID；未知 ID {finding_id!r} 已拒绝"))
+    reason = payload.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="例外理由不能为空")
+    try:
+        expires = parse_datetime(payload.expires_at)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    now = utc_now()
+    if expires <= now:
+        raise HTTPException(
+            status_code=400,
+            detail=("例外到期时间必须晚于当前 UTC 时间；当前为 "
+                    f"{iso_utc(now)}，提交值为 {iso_utc(expires)}"))
+    version = report_version(report)
+    exception = {
+        "analysis_id": analysis_id,
+        "report_version": version,
+        "finding_id": finding_id,
+        "reason": reason,
+        "expires_at": iso_utc(expires),
+        "created_at": iso_utc(now),
+    }
+    store.save_release_exception(exception)
+    decision = build_release_decision(
+        report, store.list_release_exceptions(analysis_id), now=now)
+    return {"exception": exception, "decision": decision,
+            "stored": True, "storage": store.status()}
 
 
 @router.post("/analyses/{analysis_id}/findings/{finding_id}/replay")
